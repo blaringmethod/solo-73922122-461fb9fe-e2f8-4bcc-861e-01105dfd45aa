@@ -127,10 +127,33 @@
         <button onclick="addRecord()">录入</button>
       </div>
       <table>
-        <thead><tr><th>任务</th><th>分区</th><th>状态</th><th>记录版本</th><th>当前版本</th><th>完成时间</th><th></th></tr></thead>
+        <thead><tr><th>任务</th><th>分区</th><th>状态（生效）</th><th>记录版本</th><th>当前版本</th><th>完成时间（生效）</th><th>修订</th><th></th></tr></thead>
         <tbody id="record-rows"></tbody>
       </table>
-      <p class="hint">记录版本 &lt; 当前版本 → 该分区前置「版本过期」；记录版本 &gt; 当前版本或分区格式与粒度不符 → 生成计划时被拒绝。</p>
+      <p class="hint">记录版本 &lt; 当前版本 → 该分区前置「版本过期」；记录版本 &gt; 当前版本或分区格式与粒度不符 → 生成计划时被拒绝。
+        状态与完成时间展示<b>生效修订</b>；计划只采用生效修订，再按完成时间挑分区最新记录。</p>
+    </div>
+
+    <div class="panel" id="correct-panel" style="display:none">
+      <h2>更正运行记录 <span class="hint" id="c-target"></span></h2>
+      <div class="form-row">
+        <label>新状态 <select id="c-status"><option value="success">success</option><option value="failed">failed</option></select></label>
+        <label>完成时间 <input id="c-finished" type="datetime-local" step="1"></label>
+        <input id="c-reason" placeholder="更正原因（必填），如：调度器误报 success，实为失败" style="width:320px">
+        <button onclick="submitCorrection()">提交更正</button>
+        <button class="ghost" onclick="closeCorrect()">取消</button>
+      </div>
+      <p class="hint">更正以新修订追加，原件保留可查；计划将采用生效修订。若页面打开期间他人已更正同一记录，提交会报冲突，请刷新后重试。</p>
+    </div>
+
+    <div class="panel" id="rev-panel" style="display:none">
+      <h2>修订历史 <span class="hint" id="rev-target"></span></h2>
+      <table>
+        <thead><tr><th>修订</th><th>类型</th><th>状态</th><th>完成时间</th><th>更正原因</th><th>更正时间</th></tr></thead>
+        <tbody id="rev-rows"></tbody>
+      </table>
+      <p class="hint">修订 1 为录入原件；其余为历次更正。当前生效修订以高亮标出。</p>
+      <button class="ghost" onclick="$('#rev-panel').style.display='none'">关闭</button>
     </div>
   </section>
 
@@ -255,18 +278,32 @@ async function delDep(id) {
 }
 
 /* ---------- 运行记录 ---------- */
+const NAIVE_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/;
 function renderRecords() {
   $('#record-rows').innerHTML = state.records.map(r => {
     const staleTag = r.config_version < r.current_version
       ? ' <span class="tag stale">过期</span>' : '';
     const badTag = r.config_version > r.current_version
       ? ' <span class="tag failed">不一致</span>' : '';
+    const corrected = r.revision > 1;
+    const revTag = corrected
+      ? `<span class="tag stale" title="更正原因：${r.correction_reason || ''}">已更正 v${r.revision}</span>`
+      : `<span class="tag ver">原件</span>`;
+    const naive = NAIVE_TS.test(r.finished_at || '');
+    const correctBtn = naive
+      ? `<button class="ghost" onclick="openCorrect(${r.id})">更正</button>`
+      : `<button class="ghost" disabled title="完成时间含时区，仅支持更正无时区记录">更正</button>`;
+    const delBtn = corrected
+      ? `<button class="ghost" disabled title="已更正记录不可删除（保留更正证据）">删除</button>`
+      : `<button class="ghost" onclick="delRecord(${r.id})">删除</button>`;
     return `<tr>
       <td><code>${r.task_name}</code></td><td>${r.partition}</td>
       <td><span class="tag ${r.status === 'success' ? 'ok' : 'failed'}">${r.status}</span></td>
       <td>v${r.config_version}${staleTag}${badTag}</td><td>v${r.current_version}</td>
-      <td>${r.finished_at}</td>
-      <td><button class="ghost" onclick="delRecord(${r.id})">删除</button></td>
+      <td>${r.finished_at}</td><td>${revTag}</td>
+      <td>${correctBtn}
+          <button class="ghost" onclick="showRevisions(${r.id})">历史</button>
+          ${delBtn}</td>
     </tr>`;
   }).join('');
 }
@@ -281,7 +318,65 @@ async function addRecord() {
 }
 async function delRecord(id) {
   try { await del(`/api/records/${id}`); showMsg('记录已删除'); refresh(); }
-  catch (e) { showMsg(e.body, true); }
+  catch (e) { showMsg(e.body, true); refresh(); }
+}
+
+/* ---------- 记录更正 ---------- */
+let correcting = null;  // {id, revision}
+function openCorrect(id) {
+  const r = state.records.find(x => x.id === id);
+  if (!r) return;
+  correcting = {id: r.id, revision: r.revision};
+  $('#c-target').textContent =
+    `#${r.id} ${r.task_name} @ ${r.partition}（基于修订 v${r.revision}）`;
+  $('#c-status').value = r.status;
+  $('#c-finished').value = (r.finished_at || '').replace(' ', 'T').slice(0, 19);
+  $('#c-reason').value = '';
+  $('#correct-panel').style.display = 'block';
+  $('#c-reason').focus();
+}
+function closeCorrect() {
+  correcting = null;
+  $('#correct-panel').style.display = 'none';
+}
+async function submitCorrection() {
+  if (!correcting) return;
+  const body = {
+    status: $('#c-status').value,
+    finished_at: $('#c-finished').value,
+    reason: $('#c-reason').value.trim(),
+    base_revision: correcting.revision,
+  };
+  try {
+    await post(`/api/records/${correcting.id}/corrections`, body);
+    showMsg('更正已保存，后续计划将采用生效修订');
+    closeCorrect(); refresh();
+  } catch (e) {
+    if (e.status === 409) {
+      showMsg('提交冲突：' + e.body, true);
+      closeCorrect(); refresh();  // 过期提交：刷新到最新修订
+    } else {
+      showMsg(e.body, true);
+    }
+  }
+}
+async function showRevisions(id) {
+  try {
+    const d = await api(`/api/records/${id}/revisions`);
+    $('#rev-target').textContent =
+      `#${d.record_id} ${d.task_name || ''} @ ${d.partition}（当前生效 v${d.current_revision}）`;
+    $('#rev-rows').innerHTML = d.revisions.map(v => {
+      const cur = v.revision_no === d.current_revision;
+      return `<tr${cur ? ' style="background:#212c44"' : ''}>
+        <td>v${v.revision_no}${cur ? '（生效）' : ''}</td>
+        <td>${v.kind === 'original' ? '原件' : '更正'}</td>
+        <td><span class="tag ${v.status === 'success' ? 'ok' : 'failed'}">${v.status}</span></td>
+        <td>${v.finished_at}</td><td>${v.reason || '—'}</td>
+        <td>${v.created_at || '—'}</td>
+      </tr>`;
+    }).join('');
+    $('#rev-panel').style.display = 'block';
+  } catch (e) { showMsg(e.body, true); }
 }
 
 /* ---------- 计划 ---------- */

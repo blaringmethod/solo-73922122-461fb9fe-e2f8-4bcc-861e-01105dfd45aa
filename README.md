@@ -5,6 +5,10 @@
 并标出**缺失 / 失败 / 版本过期**的前置；依赖成环或记录与当前配置不一致时**拒绝生成**。
 计划落库时固化生成时刻的配置快照，刷新页面、重启服务后仍可查看。
 
+调度器误报分区结果时，可在网页上**更正运行记录**（新状态 + 完成时间 + 更正原因）：
+原件与每次修订全部留痕可查，后续计划只采用各记录的**生效修订**，
+再按完成时间挑出分区最新记录判定是否重跑；已保存的计划不回溯改写。
+
 ## 快速开始
 
 ### Docker Compose（推荐）
@@ -35,6 +39,8 @@ SEED_IF_EMPTY=1 .venv/bin/python -m uvicorn app.main:app --port 8000
 1. **任务与依赖**：登记目标表（日/小时粒度），配置「下游 ← 上游 + 跨日偏移」。
    修改粒度或增删依赖会使该任务配置版本 +1。
 2. **运行记录**：按分区录入 success/failed，并携带运行时配置版本。
+   发现误报时点击「更正」：填新状态、完成时间（`YYYY-MM-DDTHH:MM:SS`，无时区）与更正原因；
+   点击「历史」查看原件及每次修订。
 3. **生成计划**：选目标任务 + 业务日期，一键生成；被拒绝时会说明原因并留痕。
 4. **计划列表**：查看历史计划及其配置快照（含各任务当时版本）。
 
@@ -51,7 +57,18 @@ SEED_IF_EMPTY=1 .venv/bin/python -m uvicorn app.main:app --port 8000
 | 必要展开 | 已就绪分区视为满足，停止向上展开；其余分区继续展开上游 |
 | 执行波次 | 待回填分区按依赖拓扑分层，第 N 波全部完成后才能跑第 N+1 波，波内可并行 |
 | 拒绝生成 | 依赖成环；可达任务的记录分区格式与粒度不符；记录版本高于当前配置版本；展开规模超限 |
-| 计划快照 | 生成时固化任务/依赖/版本快照与逐项状态，存于 SQLite，重启可查 |
+| 计划快照 | 生成时固化任务/依赖/版本快照与逐项状态，存于 SQLite，重启可查；已保存计划不因后续更正而改写 |
+
+### 记录更正
+
+| 概念 | 说明 |
+|---|---|
+| 原件与修订 | 录入内容为修订 1（原件）；每次更正追加一条修订，原件永不覆盖，全部可查 |
+| 生效修订 | 修订号最大的一条；总览与计划一律采用生效修订的状态/完成时间 |
+| 最新记录 | 同一（任务, 分区）下按生效完成时间（并列再按 id）挑最新记录判定前置状态 |
+| 更正条件 | 仅支持完成时间**无时区**的记录；新完成时间须为 `YYYY-MM-DDTHH:MM:SS`；原因必填 |
+| 并发冲突 | 更正基于 `base_revision` 乐观锁：两个窗口同时更正同一记录，过期提交返回 409，需刷新重试 |
+| 更正 vs 删除 | 已更正的记录禁止删除（409），避免抹掉更正证据或产生孤立修订；未更正记录可正常删除；含已更正记录的任务同样禁止删除 |
 
 ## API 摘要
 
@@ -60,7 +77,9 @@ SEED_IF_EMPTY=1 .venv/bin/python -m uvicorn app.main:app --port 8000
 | GET | `/api/state` | 任务/依赖/记录总览 |
 | POST/PUT/DELETE | `/api/tasks[/{id}]` | 任务管理（改粒度自动升版本） |
 | POST/DELETE | `/api/dependencies[/{id}]` | 依赖管理（下游版本联动 +1） |
-| POST/DELETE | `/api/records[/{id}]` | 运行记录（带配置版本） |
+| POST/DELETE | `/api/records[/{id}]` | 运行记录（带配置版本）；已更正记录删除返回 409 |
+| POST | `/api/records/{id}/corrections` | 更正记录（新状态/完成时间/原因 + `base_revision` 乐观锁，过期提交 409） |
+| GET | `/api/records/{id}/revisions` | 原件及每次修订的完整历史 |
 | POST | `/api/plans` | 生成计划；拒绝时返回 409 + 原因（同时落库留痕） |
 | GET | `/api/plans`, `/api/plans/{id}` | 计划列表 / 详情（含快照） |
 | POST | `/api/seed` | 空库时写入示例数据 |
@@ -71,11 +90,12 @@ SEED_IF_EMPTY=1 .venv/bin/python -m uvicorn app.main:app --port 8000
 
 ```
 app/
-  main.py        # FastAPI 路由
+  main.py        # FastAPI 路由（含记录更正/修订历史）
   planner.py     # 核心规划器：展开/状态/波次/拒绝（纯函数，可单测）
-  db.py          # SQLite 连接与建表
+  db.py          # SQLite 连接与建表（含修订表、生效修订视图、旧库迁移）
   seed.py        # 示例数据（CLI: python -m app.seed）
   static/index.html  # 单页操作界面
-tests/test_planner.py
+tests/test_planner.py      # 规划器单测
+tests/test_corrections.py  # 更正/并发/删除语义 API 测试
 Dockerfile / docker-compose.yml / requirements.txt
 ```

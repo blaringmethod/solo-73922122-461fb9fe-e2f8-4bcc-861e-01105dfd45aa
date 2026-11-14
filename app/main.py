@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -10,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from .db import get_conn, init_db, rows
+from .db import EFFECTIVE_RECORDS_SQL, get_conn, immediate_tx, init_db, rows
 from .planner import build_plan, parse_partition
 from .seed import seed_if_empty
 
@@ -55,6 +56,13 @@ class RecordIn(BaseModel):
     finished_at: str | None = None
 
 
+class CorrectionIn(BaseModel):
+    status: str = Field(pattern="^(success|failed)$")
+    finished_at: str  # YYYY-MM-DDTHH:MM:SS（无时区）
+    reason: str = Field(min_length=1, max_length=500)
+    base_revision: int = Field(ge=1)  # 提交时看到的修订号，过期提交报冲突
+
+
 class PlanIn(BaseModel):
     target_task_id: int
     biz_date: str  # YYYY-MM-DD
@@ -80,10 +88,11 @@ def state():
             JOIN tasks ut ON ut.id = d.upstream_id
             ORDER BY d.id""")
         records = rows(conn, """
-            SELECT r.*, t.name AS task_name, t.granularity,
+            SELECT e.*, t.name AS task_name, t.granularity,
                    t.config_version AS current_version
-            FROM run_records r JOIN tasks t ON t.id = r.task_id
-            ORDER BY r.finished_at DESC, r.id DESC LIMIT 500""")
+            FROM (""" + EFFECTIVE_RECORDS_SQL + """) e
+            JOIN tasks t ON t.id = e.task_id
+            ORDER BY e.finished_at DESC, e.id DESC LIMIT 500""")
     return {"tasks": tasks, "dependencies": deps, "records": records}
 
 
@@ -122,7 +131,14 @@ def update_task(task_id: int, body: TaskUpdate):
 
 @app.delete("/api/tasks/{task_id}", status_code=204)
 def delete_task(task_id: int):
-    with get_conn() as conn:
+    with immediate_tx() as conn:
+        corrected = conn.execute(
+            "SELECT COUNT(*) AS c FROM run_records"
+            " WHERE task_id = ? AND revision > 1", (task_id,)).fetchone()["c"]
+        if corrected:
+            raise HTTPException(
+                409, f"该任务有 {corrected} 条已更正的运行记录，"
+                     "删除将抹掉更正证据，已拒绝")
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
@@ -168,6 +184,14 @@ def delete_dep(dep_id: int):
 
 # ---------- 运行记录 ----------
 
+# 无时区完成时间：YYYY-MM-DDTHH:MM:SS（允许小数秒；拒绝 Z / ±HH:MM 后缀）
+NAIVE_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$")
+
+
+def _is_naive_ts(ts: str) -> bool:
+    return bool(NAIVE_TS_RE.match(ts or ""))
+
+
 @app.post("/api/records", status_code=201)
 def create_record(body: RecordIn):
     parsed = parse_partition(body.partition)
@@ -190,9 +214,97 @@ def create_record(body: RecordIn):
                     (cur.lastrowid,))[0]
 
 
+@app.post("/api/records/{record_id}/corrections", status_code=201)
+def correct_record(record_id: int, body: CorrectionIn):
+    """更正一条运行记录：追加修订，原件保留，计划采用生效修订。
+
+    并发语义：base_revision 与当前修订号不一致 -> 409 冲突；
+    与删除并发时由 BEGIN IMMEDIATE 串行化，已更正记录不可删除。
+    """
+    if not _is_naive_ts(body.finished_at):
+        raise HTTPException(
+            400, "完成时间格式应为 YYYY-MM-DDTHH:MM:SS（无时区）")
+    try:
+        datetime.fromisoformat(body.finished_at)
+    except ValueError:
+        raise HTTPException(400, "完成时间不是有效的日期时间")
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(400, "更正原因不能为空")
+    with immediate_tx() as conn:
+        rec = conn.execute("SELECT * FROM run_records WHERE id = ?",
+                           (record_id,)).fetchone()
+        if not rec:
+            # 与删除并发：记录已不存在，修订无从依附
+            raise HTTPException(404, "运行记录不存在（可能已被删除）")
+        if body.base_revision != rec["revision"]:
+            raise HTTPException(
+                409, f"该记录已被他人更正（当前修订 v{rec['revision']}），"
+                     "请刷新后基于最新版本重新提交")
+        eff = rows(conn, EFFECTIVE_RECORDS_SQL + " WHERE r.id = ?",
+                   (record_id,))[0]
+        if not _is_naive_ts(eff["finished_at"]):
+            raise HTTPException(
+                400, "该记录完成时间含时区，仅支持更正无时区运行记录")
+        new_rev = rec["revision"] + 1
+        now = datetime.now().isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO record_revisions"
+            " (record_id, revision_no, status, finished_at, reason, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (record_id, new_rev, body.status, body.finished_at, reason, now))
+        conn.execute("UPDATE run_records SET revision = ? WHERE id = ?",
+                     (new_rev, record_id))
+        return {"record_id": record_id, "revision": new_rev,
+                "status": body.status, "finished_at": body.finished_at,
+                "reason": reason, "created_at": now}
+
+
+@app.get("/api/records/{record_id}/revisions")
+def record_revisions(record_id: int):
+    """原件及每次修订的完整历史（原件 = 修订 1）。"""
+    with get_conn() as conn:
+        found = rows(conn, "SELECT * FROM run_records WHERE id = ?",
+                     (record_id,))
+        if not found:
+            raise HTTPException(404, "运行记录不存在")
+        rec = found[0]
+        revs = rows(conn, """
+            SELECT rev.*, t.name AS task_name, r.partition
+            FROM record_revisions rev
+            JOIN run_records r ON r.id = rev.record_id
+            JOIN tasks t ON t.id = r.task_id
+            WHERE rev.record_id = ? ORDER BY rev.revision_no""", (record_id,))
+        task = rows(conn, "SELECT name FROM tasks WHERE id = ?",
+                    (rec["task_id"],))
+    history = [{
+        "revision_no": 1, "kind": "original",
+        "status": rec["status"], "finished_at": rec["finished_at"],
+        "reason": "", "created_at": None,
+    }] + [{
+        "revision_no": r["revision_no"], "kind": "correction",
+        "status": r["status"], "finished_at": r["finished_at"],
+        "reason": r["reason"], "created_at": r["created_at"],
+    } for r in revs]
+    return {"record_id": record_id,
+            "task_name": task[0]["name"] if task else None,
+            "partition": rec["partition"],
+            "current_revision": rec["revision"],
+            "revisions": history}
+
+
 @app.delete("/api/records/{record_id}", status_code=204)
 def delete_record(record_id: int):
-    with get_conn() as conn:
+    """删除记录：已更正的记录禁止删除（保留更正证据，杜绝孤立修订）。"""
+    with immediate_tx() as conn:
+        rec = conn.execute("SELECT revision FROM run_records WHERE id = ?",
+                           (record_id,)).fetchone()
+        if not rec:
+            raise HTTPException(404, "运行记录不存在")
+        if rec["revision"] > 1:
+            raise HTTPException(
+                409, "该记录存在更正历史，删除将抹掉更正证据，已拒绝；"
+                     "如需移除请联系管理员审计后处理")
         conn.execute("DELETE FROM run_records WHERE id = ?", (record_id,))
 
 
@@ -217,7 +329,8 @@ def create_plan(body: PlanIn):
     with get_conn() as conn:
         tasks = rows(conn, "SELECT * FROM tasks")
         deps = rows(conn, "SELECT * FROM dependencies")
-        records = rows(conn, "SELECT * FROM run_records")
+        # 计划只采用各记录的生效修订；分区最新记录由规划器按完成时间挑选
+        records = rows(conn, EFFECTIVE_RECORDS_SQL)
         result = build_plan(tasks, deps, records,
                             body.target_task_id, body.biz_date)
         target_name = result["snapshot"].get("target_task_name") or \
